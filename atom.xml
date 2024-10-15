@@ -6,7 +6,7 @@
   <link href="https://galaxy-ryan.github.io/atom.xml" rel="self"/>
   
   <link href="https://galaxy-ryan.github.io/"/>
-  <updated>2024-10-07T15:00:51.000Z</updated>
+  <updated>2024-10-11T05:16:10.000Z</updated>
   <id>https://galaxy-ryan.github.io/</id>
   
   <author>
@@ -15,6 +15,63 @@
   </author>
   
   <generator uri="https://hexo.io/">Hexo</generator>
+  
+  <entry>
+    <title>CMU15445-Project4-学习心得与记录</title>
+    <link href="https://galaxy-ryan.github.io/article/2024/10/11/15445-p4.html/"/>
+    <id>https://galaxy-ryan.github.io/article/2024/10/11/15445-p4.html/</id>
+    <published>2024-10-11T05:16:10.000Z</published>
+    <updated>2024-10-11T05:16:10.000Z</updated>
+    
+    <content type="html"><![CDATA[<p>终于来到CMU-15445课程的最后一部分，并发事务控制，这一部分的实现难度也更大，我也是通过这里的学习为后来的计算机系统能力大赛打下了良好的编程基础吧，再次感谢Andy对这门开源课程的贡献。</p><p>P4主要分为以下三个部分：</p><ul><li><strong>Lock Manager：</strong>锁管理器，利用 2PL 协议实现并发控制。支持 <code>REPEATABLE_READ</code>、<code>READ_COMMITTED</code> 和 <code>READ_UNCOMMITTED</code> 三种隔离级别，支持 <code>SHARED</code>、<code>EXCLUSIVE</code>、<code>INTENTION_SHARED</code>、<code>INTENTION_EXCLUSIVE</code> 和 <code>SHARED_INTENTION_EXCLUSIVE</code> 五种锁，支持 table 和 row 两种锁粒度，支持锁升级。这是P4最重点的部分。</li><li><strong>Deadlock Detection：</strong>死锁检测，运行在一个 background 线程，每间隔一定时间检测当前是否出现死锁，并挑选合适的事务将其 abort 以解开死锁。</li><li><strong>Concurrent Query Execution：</strong>修改之前实现的 <code>SeqScan</code>、<code>Insert</code> 和 <code>Delete</code> 算子，加上适当的锁以实现并发的查询。</li></ul><h2 id="Task1-Lock-Manager"><a href="#Task1-Lock-Manager" class="headerlink" title="Task1 Lock Manager"></a>Task1 Lock Manager</h2><p>这一个任务需要根据两阶段锁协议实现在不同隔离级别下的锁并发控制。不同隔离级别下解决的异常情况存在差异。</p><p><img src="1.png" alt="1" loading="lazy"></p><p>Lock Manager 的作用是处理事务发送的锁请求，例如有一个 SeqScan 算子需要扫描某张表，其所在事务就需要对这张表加 S 锁。而加读锁这个动作需要由 Lock Manager 来完成。需要注意的是，P4 中的实现细节很多，在我们进行相关操作后都需要同步和维护相应的状态。</p><p>首先我们来讲讲两阶段封锁协议并发控制算法：这个算法的思想是，将事务加锁和解锁分为两个阶段，分别为事务增长阶段和事务收缩阶段。我们在事务增长的阶段进行加锁，在释放一个封锁之后进入收缩阶段，而一旦事务进入收缩阶段后就不能加锁和获得任何其他封锁，只能进行事务解锁，从而保证事务的可串行化并发调度正确。由于这里只需要我们实现读未提交、读已提交以及可重复度隔离级别，因此我们不需要严格遵循两阶段封锁来进行。</p><p>我们以表级锁加锁为例，介绍 Lock Manager 的实现思路：</p><ul><li><strong>检查事务的状态：</strong>若 txn 处于 Abort&#x2F;Commit 状态，则抛逻辑异常。若 txn 处于 Shrinking 状态，则需要检查 txn 的隔离级别和当前锁请求类型，在 <code>REPEATABLE_READ</code> 下，不允许解锁，造成事务终止，并抛出 <code>LOCK_ON_SHRINKING</code> 异常；在 <code>READ_COMMITTED</code> 下，若为 IS&#x2F;S 锁，则正常通过，否则抛 <code>LOCK_ON_SHRINKING</code>异常；在 <code>READ_UNCOMMITTED</code> 下，若为 IX&#x2F;X 锁，抛 <code>LOCK_ON_SHRINKING</code>异常，否则抛 <code>LOCK_SHARED_ON_READ_UNCOMMITTED</code>异常。若 txn 处于 Growing 状态，若隔离级别为 <code>READ_UNCOMMITTED</code> 且锁类型为 S&#x2F;IS&#x2F;SIX，抛 <code>LOCK_SHARED_ON_READ_UNCOMMITTED</code>。其余状态正常通过。</li><li><strong>获取锁队列：</strong>从 <code>table_lock_map_</code> 中获取 table 对应的 lock request queue。注意需要对 map 加锁，并且为了提高并发性，在获取到 queue 之后立即释放 map 的锁。若 queue 不存在则创建。</li><li><strong>检查是否需要进行锁升级：</strong>我们需要遍历队列查看有没有与当前事务 id 相同的请求。如果存在这样的请求，并且该请求已经被授予，则代表当前事务在此前已经得到了在此资源上的一把锁，接下来可能需要锁升级。因为假如事务此前的请求还没有被通过，事务会被阻塞在 Lock Manager 中，不可能再去尝试获取另一把锁。接着判断锁升级的条件，判断此前授予锁类型是否与当前请求锁类型相同。若相同，则代表是一次重复的请求，直接返回。若不同，判断当前资源上是否有另一个事务正在尝试升级。若有，则终止当前事务，抛出 <code>UPGRADE_CONFLICT</code> 异常。因为不允许多个事务在同一资源上同时尝试锁升级。然后，判断升级锁的类型和之前锁是否兼容，不能反向升级。</li><li><strong>将锁请求加入请求队列，并尝试获取锁：</strong>这里需要用到条件变量，条件变量是线程同步中的一种机制，通常和互斥锁配合使用来完成线程同步通信。条件变量与互斥锁配合使用。首先需要持有锁，并查看是否能够获取资源。这个锁与资源绑定，是用来保护资源的锁。若暂时无法获取资源，则调用条件变量的 wait 函数，此时当前线程会被挂起，以节省资源。此外，允许有多个线程在 wait 同一个 latch。当其他线程的活动使得资源状态发生改变时，需要调用条件遍历的 <code>notify_all()</code> 函数，将阻塞在此条件变量上的所有线程进行唤醒。</li><li><strong>进行锁授予：</strong>我们需要遍历请求队列，判断当前锁请求是否与所有的已经 granted 的请求兼容，若存在不兼容的请求则不能进行锁授予。接着需要我们判断优先级，遍历队列，如果当前请求是第一个 waiting 状态的请求，则代表优先级最高。如果当前请求前面还存在其他 waiting 请求，则要判断当前请求是否和前面的 waiting 请求兼容。若兼容，则仍可以视为优先级最高。若存在不兼容的请求，则优先级不为最高。也就是所有兼容的锁请求可以被一起授予。</li></ul><p>接着我们介绍事务解锁时 Lock Manager 的实现思路，同样以表级锁解锁为例：</p><ul><li>检查表上的行级锁是否都已经进行释放。</li><li>获取对应的请求队列，遍历请求队列，找到对应的锁请求，若不存在对应的请求，抛 <code>ATTEMPTED_UNLOCK_BUT_NO_LOCK_HELD</code> 异常。找到对应的请求后，根据事务的隔离级别和锁类型修改其状态。当隔离级别为 <code>REPEATABLE_READ</code> 时，S&#x2F;X 锁释放会使事务进入 Shrinking 状态。当为 <code>READ_COMMITTED</code> 时，只有 X 锁释放使事务进入 Shrinking 状态。当为 <code>READ_UNCOMMITTED</code> 时，X 锁释放使事务 Shrinking，S 锁不会出现。</li><li>最后，在请求队列中移除对应的锁请求即可。</li></ul><h2 id="Task2-Deadlock-Detection"><a href="#Task2-Deadlock-Detection" class="headerlink" title="Task2 Deadlock Detection"></a>Task2 Deadlock Detection</h2><p>由于我们采用两阶段封锁协议，可能会遇到多个事务的循环等待而产生的死锁问题。在这一部分，我们需要使用wait for图算法来定期检查事务之间的等待关系，如果图中出现环的结构，则代表出现死锁，需要挑选事务终止以打破死锁。这里我们并不需要时刻维护 wait for 图，而是在死锁检测线程被唤醒时，根据当前请求队列构建 wait for 图，再通过 wait for 图判断是否存在死锁。当判断完成后，将丢弃当前 wait for 图。下次线程被唤醒时再重新构建。 </p><p>构建 wait for 图的过程是，遍历 <code>table_lock_map</code> 和 <code>row_lock_map</code> 中所有的请求队列，对于每一个请求队列，将所有满足等待关系的一对 tid 加入 wait for 图的边集。满足等待关系是指，对于两个事务 a 和 b，a 是 waiting 请求，b 是 granted 请求，则生成 <code>a-&gt;b</code> 一条边。</p><p>在成功构建 wait for 图后，我们通过<code>DFS</code>搜索算法进行有向图环检测。在发现环后，我们可以得到环上的所有节点。此时我们挑选最年轻的事务将其终止，释放其持有的锁，并唤醒正在阻塞的相关事务。需要注意，图中可能存在多个环，需要我们重复这个过程直到当前存在的所有环都被打破。</p><h2 id="Task3-Concurrent-Query-Execution"><a href="#Task3-Concurrent-Query-Execution" class="headerlink" title="Task3 Concurrent Query Execution"></a>Task3 Concurrent Query Execution</h2><p>这一部分需要我们将 transaction 应用到之前实现的算子（Insert、Delete与SeqScan）中，以支持事务的并发执行。</p><p><strong>SeqScan：</strong>在<code>READ_UNCOMMITTED</code>的隔离级别下则无需加锁。在 <code>READ_COMMITTED</code> 下，在 <code>Next()</code> 函数中，若表中已经没有数据，则提前释放之前持有的锁。在 <code>REPEATABLE_READ</code> 下，在 Commit&#x2F;Abort 时统一释放，无需手动释放。在进行表扫描的时候，我们需要先给表加上意向读锁，然后给相应的行加上 S 锁。当然如果是全表扫描则可以直接给表加上读锁。</p><p><strong>Insert&amp;Delete：</strong>在这里，两个算子的加锁思路类似。我们需要先给对应的表加上意向写锁，再为行加上 X 锁。锁在 Commit&#x2F;Abort 时统一释放，无需手动释放。在这里其实就可以发现，我们为 Insert 算子加行锁是解决不了幻读问题的，因为插入的是新构造的元组，而我们无法解决查询时的间隙问题。当然在P4不需要我们实现可串行化隔离级别，因此就不用考虑这个问题。</p><p>最后，终于完成CMU-15445的学习笔记记录啦，总的来说还是有很多收获的，特别是混杂着期末和各种竞赛时痛苦Debug的那段时光！</p>]]></content>
+    
+    
+      
+      
+    <summary type="html">&lt;p&gt;终于来到CMU-15445课程的最后一部分，并发事务控制，这一部分的实现难度也更大，我也是通过这里的学习为后来的计算机系统能力大赛打下了良好的编程基础吧，再次感谢Andy对这门开源课程的贡献。&lt;/p&gt;
+&lt;p&gt;P4主要分为以下三个部分：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;stron</summary>
+      
+    
+    
+    
+    <category term="学习" scheme="https://galaxy-ryan.github.io/categories/%E5%AD%A6%E4%B9%A0/"/>
+    
+    
+    <category term="数据库系统" scheme="https://galaxy-ryan.github.io/tags/%E6%95%B0%E6%8D%AE%E5%BA%93%E7%B3%BB%E7%BB%9F/"/>
+    
+    <category term="优质课程" scheme="https://galaxy-ryan.github.io/tags/%E4%BC%98%E8%B4%A8%E8%AF%BE%E7%A8%8B/"/>
+    
+  </entry>
+  
+  <entry>
+    <title>CMU15445-Project3-学习心得与记录</title>
+    <link href="https://galaxy-ryan.github.io/article/2024/10/10/15445-p3.html/"/>
+    <id>https://galaxy-ryan.github.io/article/2024/10/10/15445-p3.html/</id>
+    <published>2024-10-10T12:54:52.000Z</published>
+    <updated>2024-10-10T12:54:52.000Z</updated>
+    
+    <content type="html"><![CDATA[<p>又记一次很久没更新了，写完项目真的应该及时记录博客思路，不过现在作为一个回顾也不错。P3这一部分需要我们实现数据库的执行引擎算子，同时需要我们阅读大量的代码来理解项目内部的数据结构。</p><p>首先我们来看一下Bustub的整体架构图：</p><p><img src="1.png" alt="1" loading="lazy"></p><p>我们梳理一下从一条<code>SQL</code>语句开始到执行结束的整个过程：一条<code>SQL</code>语句，首先经过 Parser 生成一棵抽象语法树 AST。在得到 AST 后，Binder 遍历 AST，将这些词语绑定到数据库实体上。实体是 Bustub 可以理解的各种 c++ 类。绑定完成后，得到的结果是一棵 Bustub 可以直接理解的树。把它叫做 Bustub AST。得到 Bustub AST 后，Planner 遍历这棵树，生成初步的查询计划。查询计划也是一棵树的形式，查询计划规定了数据的流向。数据从树叶流向树根，自底向上地流动，在根节点输出结果。由 Planner 得到初步的查询计划后，再将查询计划交给 Optimizer 进行修改优化（可以采用预定义规则或者代价评估的方式进行），最后生成优化过后的最终查询计划。<strong>在拿到 Optimizer 生成的具体的查询计划后，就可以生成真正执行查询计划的一系列算子了，也就是我们在P3中需要实现的部分。</strong></p><p>算子的执行模型大致分为以下三种：</p><ol><li>Iterator Model&#x2F;Pipeline Model，或<a href="https://zhida.zhihu.com/search?content_id=218704765&content_type=Article&match_order=1&q=%E7%81%AB%E5%B1%B1%E6%A8%A1%E5%9E%8B&zhida_source=entity">火山模型</a>。每个算子都有 <code>Init()</code> 和 <code>Next()</code> 两个方法。<code>Init()</code> 对算子进行初始化工作。<code>Next()</code> 则是向下层算子请求下一条数据。当 <code>Next()</code> 返回 false 时，则代表下层算子已经没有剩余数据，迭代结束。这种模型的弊端在于函数开销大。</li><li>Materialization Model，所有算子立即计算出所有结果并返回。和 Iterator Model 相反。这种模型的弊端显而易见，当数据量较大时，内存占用很高。但减少了函数调用的开销。比较适合查询数据量较小的 OLTP workloads。</li><li>Vectorization Model，对上面两种模型的中和，一次调用返回一批数据。利于 SIMD 加速。目前比较先进的 OLAP 数据库都采用这种模型。</li></ol><p>这里课程采用的是第一种方式。</p><p><img src="2.png" alt="2" loading="lazy"></p><h2 id="Task1-Access-Method-Executors"><a href="#Task1-Access-Method-Executors" class="headerlink" title="Task1-Access Method Executors"></a>Task1-Access Method Executors</h2><p>Task 1 包含 5 个算子，SeqScan、Insert、Delete、Update 和 IndexScan。实现时所有要用到的系统资源，例如 Catalog，Buffer Pool 等，是由 <code>ExecutorContext</code> 提供的。</p><ul><li>SeqScan：需要读取给定 table 中的所有 tuple，仅会出现在查询计划的叶子节点处。这里我们使用已经提供的 <code>TableIterator</code>进行扫表的元组操作。</li><li>Insert：需要我们实现插入元组的操作，插入元组的顺序是没有要求的，这是数据中的三大写算子之一。Insert 一定是查询计划的根节点，且仅需返回一个代表修改行数的 tuple。同时，我们需要更新与 table 相关的所有 index。index 与 table 类似，同样由 Catalog 管理。需要注意的是，由于可以对不同的字段建立 index，一个 table 可能对应多个 index，所有的 index 都需要更新。</li><li>Delete：需要我们进行元组的删除，这里并不是直接删除，而是将 tuple 标记为删除状态，也就是逻辑删除，在事务提交后，再进行物理删除。同样也是作为数据库中的写算子，出现在查询计划的根节点。</li><li>Update：需要进行元组的更新，在这里，我们可以将更新步骤拆为两个部分，按照元组先插入再进行逻辑删除的思路进行拆分，从而完成元组的更新。Update算子同样也是作为数据库中的写算子出现。</li><li>IndexScan：这个算子需要我们实现索引扫描的操作。可以使用我们在 Project 2 中实现的 B+Tree Index Iterator，遍历 B+ 树叶子节点。由于我们实现的是非聚簇索引，在叶子节点只能获取到 RID，需要拿着 RID 去 table 查询对应的 tuple。</li></ul><h2 id="Task2-Aggregation-Join-Executors"><a href="#Task2-Aggregation-Join-Executors" class="headerlink" title="Task2 - Aggregation &amp; Join Executors"></a>Task2 - Aggregation &amp; Join Executors</h2><p>Task 2 包含了 3 个算子，Aggregation、NestedLoopJoin 和 HashJoin。</p><ul><li>Aggregation：这个算子需要我们实现聚合函数的相关计算。与其他算子有所不同，这个算子会打破 iteration model 的规则，在 Aggregation 的 <code>Init()</code> 函数中，我们就要将所有结果全部计算出来。而 <code>SimpleAggregationHashTable</code> 就是计算并保存 Aggregation 结果的数据结构。<code>SimpleAggregationHashTable</code> 维护一张 hashmap，键为 <code>AggregateKey</code>，值为 <code>AggregateValue</code>，均为 <code>std::vector&lt;Value&gt;</code>。key 代表 group by 的字段的数组，value 则是需要 aggregate 的字段的数组。在下层算子传来一个 tuple 时，将 tuple 的 group by 字段和 aggregate 字段分别提取出来，调用 <code>InsertCombine()</code> 将 group by 和 aggregate 的映射关系存入 <code>SimpleAggregationHashTable</code>。若当前 hashmap 中没有 group by 的记录，则创建初值；若已有记录，则按 aggregate 规则逐一更新所有的 aggregate 字段。</li><li>NestedLoopJoin：这个算子需要我们按照嵌套循环的思路实现连接算法。NestedLoopJoin 算法本身并不难，就是需要我们注意迭代器要保存上下文信息，防止遗漏部分需要连接匹配的元组。</li><li>HashJoin：这一部分需要我们编写一个优化规则，在满足一定条件时，将 NestedLoopJoin 优化为 HashJoin。那么在什么条件下优化为 HashJoin 呢？当然是满足等值条件时，即联接谓词是两列之间的等条件的联合时，就可以使用哈希联接算法。注意这一部分不需要我们考虑外部内存的连接算法。这里的基本思路是选择一张表（最好是小表）进行哈希处理，生成哈希表，因为需要内存中可以放得下。然后通过遍历另一表的数据，通过哈希键值查询进行匹配，满足条件则进行连接操作。</li></ul><h2 id="Task-3-Sort-Limit-Executors-and-Top-N-Optimization"><a href="#Task-3-Sort-Limit-Executors-and-Top-N-Optimization" class="headerlink" title="Task 3 Sort + Limit Executors and Top-N Optimization"></a>Task 3 Sort + Limit Executors and Top-N Optimization</h2><p>Task 3 中要实现 3 个算子，Sort、Limit 和 TopN，以及将 Limit + Sort 在 Optimizer 中优化为 TopN。</p><ul><li>Sort：排序算子，需要我们在 <code>Init()</code> 中读取所有下层算子的 tuple，并按 ORDER BY 的字段升序或降序排序。这里可以考虑采用自定义 <code>std::sort()</code>来实现。</li><li>Limit：这个算子需要我们限制输出前n个元组。和 SeqScan 的思路类似，只不过在内部维护一个 count，记录已经 emit 了多少 tuple。当下层算子空了或 count 达到规定上限后，不再返回新的 tuple。</li><li>TopN：这个算子需要我们返回最大&#x2F;最小的 n 个 tuple。需要我们添加优化规则，将 Sort + Limit 优化为 TopN。这里的思路是，对 plan tree 进行<a href="https://zhida.zhihu.com/search?content_id=218704765&content_type=Article&match_order=1&q=%E5%90%8E%E5%BA%8F%E9%81%8D%E5%8E%86&zhida_source=entity">后序遍历</a>，自底向上地适用规则，改写节点。遍历到 Limit 节点时，判断其下层节点是否为 Sort，若为 Sort，则将这两个节点替换为一个 TopN，进行优化。</li></ul><p>到这里，P3的主要内容就结束咯！</p>]]></content>
+    
+    
+      
+      
+    <summary type="html">&lt;p&gt;又记一次很久没更新了，写完项目真的应该及时记录博客思路，不过现在作为一个回顾也不错。P3这一部分需要我们实现数据库的执行引擎算子，同时需要我们阅读大量的代码来理解项目内部的数据结构。&lt;/p&gt;
+&lt;p&gt;首先我们来看一下Bustub的整体架构图：&lt;/p&gt;
+&lt;p&gt;&lt;img src=</summary>
+      
+    
+    
+    
+    <category term="学习" scheme="https://galaxy-ryan.github.io/categories/%E5%AD%A6%E4%B9%A0/"/>
+    
+    
+    <category term="数据库系统" scheme="https://galaxy-ryan.github.io/tags/%E6%95%B0%E6%8D%AE%E5%BA%93%E7%B3%BB%E7%BB%9F/"/>
+    
+    <category term="优质课程" scheme="https://galaxy-ryan.github.io/tags/%E4%BC%98%E8%B4%A8%E8%AF%BE%E7%A8%8B/"/>
+    
+  </entry>
   
   <entry>
     <title>分布式系统服务治理</title>
@@ -33,6 +90,8 @@
       
     
     
+    
+    <category term="技术" scheme="https://galaxy-ryan.github.io/categories/%E6%8A%80%E6%9C%AF/"/>
     
     
     <category term="分布式系统" scheme="https://galaxy-ryan.github.io/tags/%E5%88%86%E5%B8%83%E5%BC%8F%E7%B3%BB%E7%BB%9F/"/>
